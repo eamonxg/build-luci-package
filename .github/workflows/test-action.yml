@@ -15,6 +15,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pkg_type: [ipk, apk]
     steps:
       - name: Checkout action repo
         uses: actions/checkout@v6
@@ -26,10 +29,11 @@ jobs:
           path: package
           fetch-depth: 0
 
-      - name: Build luci-theme-aurora (ipk + apk)
+      - name: Build luci-theme-aurora (${{ matrix.pkg_type }})
         uses: ./
         with:
           package: luci-theme-aurora
+          pkg_type: ${{ matrix.pkg_type }}
           source_dir: package
           skip_checkout: "true"
           prep_script: |
