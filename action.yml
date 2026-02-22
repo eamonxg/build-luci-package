@@ -8,15 +8,15 @@ inputs:
     description: Package type (ipk or apk)
     required: true
   arch:
-    description: OpenWrt architecture override (default: x86_64)
+    description: "OpenWrt architecture override (default: x86_64)"
     required: false
     default: ""
   cpu_dir:
-    description: CPU directory in OpenWrt targets override (default: x86)
+    description: "CPU directory in OpenWrt targets override (default: x86)"
     required: false
     default: ""
   sub_dir:
-    description: Sub directory in OpenWrt targets override (default: 64)
+    description: "Sub directory in OpenWrt targets override (default: 64)"
     required: false
     default: ""
   sdk_url:
@@ -24,7 +24,7 @@ inputs:
     required: false
     default: ""
   sdk_cpu:
-    description: SDK CPU string override (default: x86-64)
+    description: "SDK CPU string override (default: x86-64)"
     required: false
     default: ""
   sdk_dir:
