@@ -37,6 +37,7 @@ jobs:
           source_dir: package
           skip_checkout: "true"
           prep_script: |
+            ./scripts/feeds update -f base luci
             ./scripts/feeds install -p luci-base
           artifact_paths: |
             bin/packages/$ARCH/base/*luci-theme-aurora*.[ai]pk

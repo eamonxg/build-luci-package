@@ -7,30 +7,6 @@ inputs:
   pkg_type:
     description: Package type (ipk or apk)
     required: true
-  arch:
-    description: "OpenWrt architecture override (default: x86_64)"
-    required: false
-    default: ""
-  cpu_dir:
-    description: "CPU directory in OpenWrt targets override (default: x86)"
-    required: false
-    default: ""
-  sub_dir:
-    description: "Sub directory in OpenWrt targets override (default: 64)"
-    required: false
-    default: ""
-  sdk_url:
-    description: Base SDK URL override
-    required: false
-    default: ""
-  sdk_cpu:
-    description: "SDK CPU string override (default: x86-64)"
-    required: false
-    default: ""
-  sdk_dir:
-    description: Local SDK directory name override
-    required: false
-    default: ""
   source_dir:
     description: Path to package source within workspace
     required: false
@@ -48,7 +24,7 @@ inputs:
       .vscode
       .dev
   prep_script:
-    description: Extra build steps after feeds update and before defconfig
+    description: Extra build steps to prepare feeds before defconfig
     required: false
     default: ""
   artifact_paths:
@@ -56,7 +32,8 @@ inputs:
     required: true
   release_body_path:
     description: Release body markdown path (relative to repo)
-    required: true
+    required: false
+    default: ""
   cache_on_tag:
     description: Whether to cache SDK on tag builds
     required: false
@@ -76,74 +53,50 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends build-essential curl ca-certificates xz-utils zstd git python3 rsync
 
-    - name: Resolve SDK settings
-      id: cfg
-      shell: bash
-      run: |
-        set -euo pipefail
-        TYPE="${{ inputs.pkg_type }}"
-        ARCH="${{ inputs.arch }}"
-        CPU_DIR="${{ inputs.cpu_dir }}"
-        SUB_DIR="${{ inputs.sub_dir }}"
-        SDK_URL="${{ inputs.sdk_url }}"
-        SDK_CPU="${{ inputs.sdk_cpu }}"
-        SDK_DIR="${{ inputs.sdk_dir }}"
-
-        if [ -z "$ARCH" ] || [ -z "$CPU_DIR" ] || [ -z "$SUB_DIR" ] || [ -z "$SDK_URL" ] || [ -z "$SDK_CPU" ] || [ -z "$SDK_DIR" ]; then
-          case "$TYPE" in
-            ipk)
-              ARCH="${ARCH:-x86_64}"
-              CPU_DIR="${CPU_DIR:-x86}"
-              SUB_DIR="${SUB_DIR:-64}"
-              SDK_URL="${SDK_URL:-https://downloads.openwrt.org/releases/24.10.3}"
-              SDK_CPU="${SDK_CPU:-x86-64}"
-              SDK_DIR="${SDK_DIR:-ipk_SDK}"
-              ;;
-            apk)
-              ARCH="${ARCH:-x86_64}"
-              CPU_DIR="${CPU_DIR:-x86}"
-              SUB_DIR="${SUB_DIR:-64}"
-              SDK_URL="${SDK_URL:-https://downloads.openwrt.org/snapshots}"
-              SDK_CPU="${SDK_CPU:-x86-64}"
-              SDK_DIR="${SDK_DIR:-apk_SDK}"
-              ;;
-            *)
-              echo "Unsupported pkg_type: ${TYPE}" >&2
-              exit 1
-              ;;
-          esac
-        fi
-
-        {
-          echo "arch=${ARCH}"
-          echo "cpu_dir=${CPU_DIR}"
-          echo "sub_dir=${SUB_DIR}"
-          echo "sdk_url=${SDK_URL}"
-          echo "sdk_cpu=${SDK_CPU}"
-          echo "sdk_dir=${SDK_DIR}"
-        } >> "$GITHUB_OUTPUT"
-
-    - name: Get SDK metadata
+    - name: Prepare SDK
       id: sdk
       shell: bash
       run: |
         set -euo pipefail
-        INDEX_URL="${{ steps.cfg.outputs.sdk_url }}/targets/${{ steps.cfg.outputs.cpu_dir }}/${{ steps.cfg.outputs.sub_dir }}/"
-        SDK_TAR=$(curl -s "$INDEX_URL" | grep -oE "openwrt-sdk[^\"]*${{ steps.cfg.outputs.sdk_cpu }}[^\"]*\.tar\.(zst|xz)" | head -n 1)
+        ARCH="x86_64"
+        SDK_CPU="x86-64"
+        CPU_DIR="x86"
+        SUB_DIR="64"
+        case "${{ inputs.pkg_type }}" in
+          ipk)
+            SDK_URL="https://downloads.openwrt.org/releases/24.10.3"
+            SDK_DIR="ipk_SDK"
+            ;;
+          apk)
+            SDK_URL="https://downloads.openwrt.org/snapshots"
+            SDK_DIR="apk_SDK"
+            ;;
+          *)
+            echo "Unsupported pkg_type: ${{ inputs.pkg_type }}" >&2
+            exit 1
+            ;;
+        esac
+
+        INDEX_URL="${SDK_URL}/targets/${CPU_DIR}/${SUB_DIR}/"
+        SDK_TAR=$(curl -s "$INDEX_URL" | grep -oE "openwrt-sdk[^\"]*${SDK_CPU}[^\"]*\.tar\.(zst|xz)" | head -n 1)
 
         echo "SDK: $SDK_TAR"
         curl -sI "$INDEX_URL/$SDK_TAR" | grep -iE '^(etag|last-modified|content-length):' > .sdk-meta
         cat .sdk-meta
 
-        echo "url=$INDEX_URL" >> $GITHUB_OUTPUT
-        echo "tar=$SDK_TAR" >> $GITHUB_OUTPUT
+        {
+          echo "arch=$ARCH"
+          echo "sdk_dir=$SDK_DIR"
+          echo "index_url=$INDEX_URL"
+          echo "tar=$SDK_TAR"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Cache SDK
       id: cache
       if: ${{ inputs.cache_on_tag == 'true' || github.ref_type != 'tag' }}
       uses: actions/cache@v5
       with:
-        path: tmp/${{ steps.cfg.outputs.sdk_dir }}
+        path: tmp/${{ steps.sdk.outputs.sdk_dir }}
         key: ${{ steps.sdk.outputs.tar }}-${{ inputs.pkg_type }}-${{ hashFiles('.sdk-meta') }}
 
     - name: Download SDK
@@ -153,20 +106,21 @@ runs:
         set -euo pipefail
         echo "Cache MISS - Downloading SDK"
         mkdir -p tmp
-        curl -SLk --connect-timeout 30 --retry 2 "${{ steps.sdk.outputs.url }}/${{ steps.sdk.outputs.tar }}" -o "tmp/${{ steps.sdk.outputs.tar }}"
+        curl -SLk --connect-timeout 30 --retry 2 "${{ steps.sdk.outputs.index_url }}/${{ steps.sdk.outputs.tar }}" -o "tmp/${{ steps.sdk.outputs.tar }}"
         cd tmp
         if echo "${{ steps.sdk.outputs.tar }}" | grep -q \.zst$; then
           zstd -d "${{ steps.sdk.outputs.tar }}" -o SDK.tar && tar xf SDK.tar
         else
           tar xf "${{ steps.sdk.outputs.tar }}"
         fi
-        mv $(ls -d openwrt-sdk-* | head -n 1) "${{ steps.cfg.outputs.sdk_dir }}"
+        mv $(ls -d openwrt-sdk-* | head -n 1) "${{ steps.sdk.outputs.sdk_dir }}"
 
     - name: Build ${{ inputs.package }} (${{ inputs.pkg_type }})
       shell: bash
       run: |
         set -euo pipefail
         PACKAGE="${{ inputs.package }}"
+        SDK_DIR="${{ steps.sdk.outputs.sdk_dir }}"
         SOURCE_DIR="${{ inputs.source_dir }}"
         if [ -z "$SOURCE_DIR" ]; then
           SOURCE_DIR="."
@@ -182,7 +136,7 @@ runs:
         EOF
         )
 
-        mkdir -p "tmp/${{ steps.cfg.outputs.sdk_dir }}/package/${PACKAGE}"
+        mkdir -p "tmp/${SDK_DIR}/package/${PACKAGE}"
         exclude_args=()
         while IFS= read -r pattern; do
           pattern="$(echo "$pattern" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -190,10 +144,10 @@ runs:
           exclude_args+=(--exclude "$pattern")
         done <<< "$RSYNC_EXCLUDES"
 
-        rsync -a --delete "${SOURCE_DIR}/" "tmp/${{ steps.cfg.outputs.sdk_dir }}/package/${PACKAGE}/" \
+        rsync -a --delete "${SOURCE_DIR}/" "tmp/${SDK_DIR}/package/${PACKAGE}/" \
           --exclude tmp "${exclude_args[@]}"
 
-        cd "tmp/${{ steps.cfg.outputs.sdk_dir }}"
+        cd "tmp/${SDK_DIR}"
         cp feeds.conf.default feeds.conf
         echo "=== feeds.conf ==="
         cat feeds.conf
@@ -210,9 +164,11 @@ runs:
           fi
         done
 
-        ./scripts/feeds update -f base luci
         if [ -n "${{ inputs.prep_script }}" ]; then
           ${{ inputs.prep_script }}
+        else
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
         fi
         make defconfig
         make package/${PACKAGE}/compile -j"$(nproc)" V=s
@@ -223,10 +179,10 @@ runs:
       run: |
         set -euo pipefail
         PACKAGE="${{ inputs.package }}"
+        SDK_DIR="${{ steps.sdk.outputs.sdk_dir }}"
+        ARCH="${{ steps.sdk.outputs.arch }}"
 
         resolve_paths() {
-          local sdk_dir="$1"
-          local arch="$2"
           local result=""
 
           while IFS= read -r line; do
@@ -234,19 +190,20 @@ runs:
             [ -z "$line" ] && continue
             local expanded="$line"
 
-            expanded="${expanded//\$SDK_DIR/$sdk_dir}"
-            expanded="${expanded//\$\{SDK_DIR\}/$sdk_dir}"
-            expanded="${expanded//\$ARCH/$arch}"
-            expanded="${expanded//\$\{ARCH\}/$arch}"
+            expanded="${expanded//\$SDK_DIR/$SDK_DIR}"
+            expanded="${expanded//\$\{SDK_DIR\}/$SDK_DIR}"
+            expanded="${expanded//\$ARCH/$ARCH}"
+            expanded="${expanded//\$\{ARCH\}/$ARCH}"
             expanded="${expanded//\$PACKAGE/$PACKAGE}"
             expanded="${expanded//\$\{PACKAGE\}/$PACKAGE}"
 
             if [[ "$expanded" != /* && "$expanded" != tmp/* ]]; then
-              expanded="tmp/${sdk_dir}/${expanded}"
+              expanded="tmp/${SDK_DIR}/${expanded}"
             fi
 
             result+="${expanded}"
             result+=$'\n'
+
           done << 'EOF'
         ${{ inputs.artifact_paths }}
         EOF
@@ -254,7 +211,7 @@ runs:
           printf '%s' "$result"
         }
 
-        paths="$(resolve_paths "${{ steps.cfg.outputs.sdk_dir }}" "${{ steps.cfg.outputs.arch }}")"
+        paths="$(resolve_paths)"
 
         {
           echo "paths<<EOF"
@@ -284,6 +241,10 @@ runs:
           if [ -f "$candidate" ]; then
             path="$candidate"
           fi
+        fi
+        if [ -z "$path" ] || [ ! -f "$path" ]; then
+          path="$GITHUB_WORKSPACE/.release-body-empty"
+          : > "$path"
         fi
         echo "path=$path" >> "$GITHUB_OUTPUT"
 
