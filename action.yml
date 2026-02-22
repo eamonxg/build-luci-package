@@ -19,7 +19,6 @@ inputs:
     description: Newline-separated rsync exclude patterns
     required: false
     default: |
-      .git
       .github
       .vscode
       .dev
@@ -34,11 +33,6 @@ inputs:
     description: Release body markdown path (relative to repo)
     required: false
     default: ""
-  cache_on_tag:
-    description: Whether to cache SDK on tag builds
-    required: false
-    default: "true"
-
 runs:
   using: composite
   steps:
@@ -93,7 +87,7 @@ runs:
 
     - name: Cache SDK
       id: cache
-      if: ${{ inputs.cache_on_tag == 'true' || github.ref_type != 'tag' }}
+      if: ${{ github.ref_type != 'tag' }}
       uses: actions/cache@v5
       with:
         path: tmp/${{ steps.sdk.outputs.sdk_dir }}
