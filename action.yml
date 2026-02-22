@@ -1,0 +1,277 @@
+name: Build LuCI Package
+description: Build and release OpenWrt LuCI packages via SDK (ipk + apk)
+inputs:
+  package:
+    description: LuCI package name (e.g. luci-theme-aurora)
+    required: true
+  source_dir:
+    description: Path to package source within workspace
+    required: false
+    default: "."
+  skip_checkout:
+    description: Set to "true" to skip actions/checkout (repo already present)
+    required: false
+    default: "false"
+  rsync_excludes:
+    description: Newline-separated rsync exclude patterns
+    required: false
+    default: |
+      .git
+      .github
+      .vscode
+      .dev
+  prep_script:
+    description: Extra build steps after feeds update and before defconfig
+    required: false
+    default: ""
+  artifact_paths:
+    description: Newline-separated artifact paths (relative to SDK dir, supports $ARCH/$SDK_DIR/$PACKAGE)
+    required: true
+  release_body_path:
+    description: Release body markdown path (relative to repo)
+    required: true
+  cache_on_tag:
+    description: Whether to cache SDK on tag builds
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v6
+      if: ${{ inputs.skip_checkout != 'true' }}
+      with:
+        fetch-depth: 0
+
+    - name: Install build deps
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential curl ca-certificates xz-utils zstd git python3 rsync
+
+    - name: Get SDK metadata
+      id: sdk
+      shell: bash
+      run: |
+        set -euo pipefail
+        get_sdk() {
+          local type="$1"
+          local base_url="$2"
+          local cpu_dir="$3"
+          local sub_dir="$4"
+          local sdk_cpu="$5"
+          local index_url="${base_url}/targets/${cpu_dir}/${sub_dir}/"
+          local sdk_tar
+
+          sdk_tar=$(curl -s "$index_url" | grep -oE "openwrt-sdk[^\"]*${sdk_cpu}[^\"]*\.tar\.(zst|xz)" | head -n 1)
+          echo "SDK ${type}: ${sdk_tar}"
+          curl -sI "${index_url}/${sdk_tar}" | grep -iE '^(etag|last-modified|content-length):' > ".sdk-meta-${type}"
+
+          echo "${type}_url=${index_url}" >> "$GITHUB_OUTPUT"
+          echo "${type}_tar=${sdk_tar}" >> "$GITHUB_OUTPUT"
+        }
+
+        get_sdk ipk "https://downloads.openwrt.org/releases/24.10.3" x86 64 x86-64
+        get_sdk apk "https://downloads.openwrt.org/snapshots" x86 64 x86-64
+
+    - name: Cache SDK
+      id: cache
+      if: ${{ inputs.cache_on_tag == 'true' || github.ref_type != 'tag' }}
+      uses: actions/cache@v5
+      with:
+        path: |
+          tmp/ipk_SDK
+          tmp/apk_SDK
+        key: ${{ steps.sdk.outputs.ipk_tar }}-${{ steps.sdk.outputs.apk_tar }}-${{ hashFiles('.sdk-meta-ipk', '.sdk-meta-apk') }}
+
+    - name: Download SDKs
+      if: ${{ steps.cache.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        download_sdk() {
+          local type="$1"
+          local url="$2"
+          local tar="$3"
+          local sdk_dir="$4"
+
+          echo "Downloading ${type} SDK: ${tar}"
+          mkdir -p tmp
+          curl -SLk --connect-timeout 30 --retry 2 "${url}/${tar}" -o "tmp/${tar}"
+          cd tmp
+          if echo "${tar}" | grep -q \.zst$; then
+            zstd -d "${tar}" -o SDK.tar && tar xf SDK.tar
+          else
+            tar xf "${tar}"
+          fi
+          mv $(ls -d openwrt-sdk-* | head -n 1) "${sdk_dir}"
+          cd - >/dev/null
+        }
+
+        download_sdk ipk "${{ steps.sdk.outputs.ipk_url }}" "${{ steps.sdk.outputs.ipk_tar }}" "ipk_SDK"
+        download_sdk apk "${{ steps.sdk.outputs.apk_url }}" "${{ steps.sdk.outputs.apk_tar }}" "apk_SDK"
+
+    - name: Build packages
+      shell: bash
+      run: |
+        set -euo pipefail
+        PACKAGE="${{ inputs.package }}"
+        SOURCE_DIR="${{ inputs.source_dir }}"
+        if [ -z "$SOURCE_DIR" ]; then
+          SOURCE_DIR="."
+        fi
+        SOURCE_DIR="${SOURCE_DIR%/}"
+        if [ ! -d "$SOURCE_DIR" ]; then
+          echo "source_dir not found: $SOURCE_DIR"
+          exit 1
+        fi
+
+        RSYNC_EXCLUDES=$(cat <<'EOF'
+        ${{ inputs.rsync_excludes }}
+        EOF
+        )
+
+        build_one() {
+          local type="$1"
+          local sdk_dir="$2"
+
+          echo "=== Build ${PACKAGE} (${type}) ==="
+          mkdir -p "tmp/${sdk_dir}/package/${PACKAGE}"
+
+          local exclude_args=()
+          while IFS= read -r pattern; do
+            pattern="$(echo "$pattern" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$pattern" ] && continue
+            exclude_args+=(--exclude "$pattern")
+          done <<< "$RSYNC_EXCLUDES"
+
+          rsync -a --delete "${SOURCE_DIR}/" "tmp/${sdk_dir}/package/${PACKAGE}/" \
+            --exclude tmp "${exclude_args[@]}"
+
+          cd "tmp/${sdk_dir}"
+          cp feeds.conf.default feeds.conf
+          echo "=== feeds.conf ==="
+          cat feeds.conf
+          echo "---------- testing feed git URLs ----------"
+          grep -E '^[[:space:]]*src-git' feeds.conf | while read -r line; do
+            name=$(echo "$line" | awk '{print $(NF-1)}')
+            url_with_rev=$(echo "$line" | awk '{print $NF}')
+            url_base=${url_with_rev%%^*}
+            url=${url_base%%;*}
+            if git ls-remote "$url" HEAD >/dev/null 2>&1; then
+              echo "OK: $name $url_with_rev (remote: $url)"
+            else
+              echo "FAILED: $name $url_with_rev (remote: $url)"
+            fi
+          done
+
+          ./scripts/feeds update -f base luci
+          if [ -n "${{ inputs.prep_script }}" ]; then
+            ${{ inputs.prep_script }}
+          fi
+          make defconfig
+          make package/${PACKAGE}/compile -j"$(nproc)" V=s
+
+          cd - >/dev/null
+        }
+
+        build_one ipk ipk_SDK
+        build_one apk apk_SDK
+
+    - name: Resolve artifact paths
+      id: artifacts
+      shell: bash
+      run: |
+        set -euo pipefail
+        PACKAGE="${{ inputs.package }}"
+
+        resolve_paths() {
+          local sdk_dir="$1"
+          local arch="$2"
+          local result=""
+
+          while IFS= read -r line; do
+            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            local expanded="$line"
+
+            expanded="${expanded//\$SDK_DIR/$sdk_dir}"
+            expanded="${expanded//\$\{SDK_DIR\}/$sdk_dir}"
+            expanded="${expanded//\$ARCH/$arch}"
+            expanded="${expanded//\$\{ARCH\}/$arch}"
+            expanded="${expanded//\$PACKAGE/$PACKAGE}"
+            expanded="${expanded//\$\{PACKAGE\}/$PACKAGE}"
+
+            if [[ "$expanded" != /* && "$expanded" != tmp/* ]]; then
+              expanded="tmp/${sdk_dir}/${expanded}"
+            fi
+
+            result+="${expanded}"
+            result+=$'\n'
+          done << 'EOF'
+        ${{ inputs.artifact_paths }}
+        EOF
+
+          printf '%s' "$result"
+        }
+
+        ipk_paths="$(resolve_paths ipk_SDK x86_64)"
+        apk_paths="$(resolve_paths apk_SDK x86_64)"
+        release_files="${ipk_paths}${apk_paths}"
+
+        write_output() {
+          local name="$1"
+          local value="$2"
+          {
+            echo "${name}<<EOF"
+            printf '%s\n' "$value"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        write_output ipk_paths "$ipk_paths"
+        write_output apk_paths "$apk_paths"
+        write_output release_files "$release_files"
+
+    - name: Resolve release body path
+      id: release_body
+      shell: bash
+      run: |
+        set -euo pipefail
+        path="${{ inputs.release_body_path }}"
+        source_dir="${{ inputs.source_dir }}"
+        if [ -z "$source_dir" ]; then
+          source_dir="."
+        fi
+        if [[ "$path" != /* && "$path" != ./* && "$source_dir" != "." ]]; then
+          candidate="${source_dir%/}/${path}"
+          if [ -f "$candidate" ]; then
+            path="$candidate"
+          fi
+        fi
+        echo "path=$path" >> "$GITHUB_OUTPUT"
+
+    - name: Upload ipk artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ inputs.package }}-${{ github.ref_name }}-ipk
+        path: |
+          ${{ steps.artifacts.outputs.ipk_paths }}
+
+    - name: Upload apk artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ inputs.package }}-${{ github.ref_name }}-apk
+        path: |
+          ${{ steps.artifacts.outputs.apk_paths }}
+
+    - name: Release ${{ inputs.package }}
+      if: ${{ github.ref_type == 'tag' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        name: ${{ inputs.package }}-${{ github.ref_name }}
+        body_path: ${{ steps.release_body.outputs.path }}
+        draft: false
+        prerelease: false
+        files: |
+          ${{ steps.artifacts.outputs.release_files }}

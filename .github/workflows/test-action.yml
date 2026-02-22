@@ -1,0 +1,39 @@
+name: Test Build LuCI Package Action
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - action.yml
+      - .github/workflows/test-action.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout action repo
+        uses: actions/checkout@v6
+
+      - name: Checkout luci-theme-aurora
+        uses: actions/checkout@v6
+        with:
+          repository: eamonxg/luci-theme-aurora
+          path: package
+          fetch-depth: 0
+
+      - name: Build luci-theme-aurora (ipk + apk)
+        uses: ./
+        with:
+          package: luci-theme-aurora
+          source_dir: package
+          skip_checkout: "true"
+          prep_script: |
+            ./scripts/feeds install -p luci-base
+          artifact_paths: |
+            bin/packages/$ARCH/base/*luci-theme-aurora*.[ai]pk
+          release_body_path: package/.dev/docs/changelog/${{ github.ref_name }}.md
